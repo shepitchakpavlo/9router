@@ -214,11 +214,21 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
     };
 
     if (responseBody.usage) {
+      // Keep the Claude cache counters on the intermediate OpenAI body: the
+      // final filterUsageForFormat(...OPENAI) folds them into cached_tokens /
+      // prompt_tokens_details. Dropping them here made every non-streaming
+      // Anthropic-backed request report 0 cache reads to the client.
       result.usage = {
         prompt_tokens: responseBody.usage.input_tokens || 0,
         completion_tokens: responseBody.usage.output_tokens || 0,
         total_tokens: (responseBody.usage.input_tokens || 0) + (responseBody.usage.output_tokens || 0)
       };
+      if (typeof responseBody.usage.cache_read_input_tokens === "number") {
+        result.usage.cache_read_input_tokens = responseBody.usage.cache_read_input_tokens;
+      }
+      if (typeof responseBody.usage.cache_creation_input_tokens === "number") {
+        result.usage.cache_creation_input_tokens = responseBody.usage.cache_creation_input_tokens;
+      }
     }
     return result;
   }

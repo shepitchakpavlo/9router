@@ -108,7 +108,42 @@ export function filterUsageForFormat(usage, targetFormat) {
     fields = formatFields.default;
   }
 
+  // Claude-style cache counters (cache_read_input_tokens / cache_creation_input_tokens)
+  // are NOT OpenAI fields, so pickFields() silently dropped them whenever an
+  // Anthropic upstream answered an OpenAI-wire client (Claude Code via cc/*,
+  // Hermes). Clients then reported 0 cache reads although the router's own log
+  // showed hits. Canonicalize to OpenAI semantics before filtering:
+  // prompt_tokens INCLUDES cache, cached_tokens = cache-read subset.
+  if (fields === formatFields.default) {
+    usage = foldClaudeCacheIntoOpenAI(usage);
+  }
+
   return pickFields(fields);
+}
+
+// Claude reports input_tokens EXCLUDING cache; OpenAI reports prompt_tokens
+// INCLUDING cached_tokens. Fold the cache counters so an OpenAI client sees both
+// a truthful prompt_tokens and the cache breakdown.
+function foldClaudeCacheIntoOpenAI(usage) {
+  const read = typeof usage.cache_read_input_tokens === "number" ? usage.cache_read_input_tokens : 0;
+  const create = typeof usage.cache_creation_input_tokens === "number" ? usage.cache_creation_input_tokens : 0;
+  if (!read && !create) return usage;
+  const folded = { ...usage };
+  const details = { ...(usage.prompt_tokens_details || {}) };
+  if (read > 0) {
+    folded.cached_tokens = read;
+    details.cached_tokens = read;
+    if (typeof folded.prompt_tokens === "number") folded.prompt_tokens += read;
+  }
+  if (create > 0) {
+    details.cache_creation_tokens = create;
+    if (typeof folded.prompt_tokens === "number") folded.prompt_tokens += create;
+  }
+  folded.prompt_tokens_details = details;
+  if (typeof folded.prompt_tokens === "number" && typeof folded.completion_tokens === "number") {
+    folded.total_tokens = folded.prompt_tokens + folded.completion_tokens;
+  }
+  return folded;
 }
 
 /**
