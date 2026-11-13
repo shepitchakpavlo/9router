@@ -13,6 +13,18 @@ import { DEFAULT_MAX_TOKENS } from "../../config/runtimeConfig.js";
 const CACHE_CONTROL_5M = { type: "ephemeral" };
 const CACHE_CONTROL_1H = { type: "ephemeral", ttl: "1h" };
 
+// Long agent sessions take breaks (user thinking, slow tools) longer than the 5m
+// default, and every break re-wrote an already-cached tail at full price. From
+// TAIL_1H_MIN_MESSAGES on, anchor the volatile tail (last assistant / final tool
+// results) with the 1h TTL: writes cost 2x instead of 1.25x, but a post-break
+// read costs 0.1x instead of a full re-send. Short chats keep the cheap 5m.
+const TAIL_1H_MIN_MESSAGES = 12;
+
+function tailCacheControl(messages) {
+  const n = Array.isArray(messages) ? messages.length : 0;
+  return n >= TAIL_1H_MIN_MESSAGES ? CACHE_CONTROL_1H : CACHE_CONTROL_5M;
+}
+
 // Anthropic rejects a tool carrying BOTH defer_loading:true and cache_control
 // ("Tools defer_loading cannot use prompt caching", #3567). MCP clients put
 // deferred tools at the tail, which is exactly where the cache anchor lands.
@@ -358,15 +370,16 @@ export function ensureTrailingUserTurn(messages, originalLastRole) {
   return [...messages, { role: ROLE.USER, content: [{ type: CLAUDE_BLOCK.TEXT, text: TRAILING_USER_PLACEHOLDER }] }];
 }
 
-// Put a 5m breakpoint on the last cache-eligible block of a message.
+// Put a breakpoint on the last cache-eligible block of a message (5m by default,
+// 1h for the tail of a long session — see tailCacheControl).
 // thinking/redacted_thinking blocks do not accept cache_control.
-function markLastCacheableBlock(msg) {
+function markLastCacheableBlock(msg, cacheControl = CACHE_CONTROL_5M) {
   if (!Array.isArray(msg?.content)) return false;
   for (let i = msg.content.length - 1; i >= 0; i--) {
     const block = msg.content[i];
     if (typeof block !== "object" || block === null) continue;
     if (block.type === CLAUDE_BLOCK.THINKING || block.type === CLAUDE_BLOCK.REDACTED_THINKING) continue;
-    block.cache_control = { ...CACHE_CONTROL_5M };
+    block.cache_control = { ...cacheControl };
     return true;
   }
   return false;
@@ -384,7 +397,7 @@ function markFinalToolResults(body) {
   if (!last.content.some((block) => block?.type === CLAUDE_BLOCK.TOOL_RESULT)) return false;
   if (last.content.some((block) => block?.cache_control)) return false;
   if (countCacheControlBlocks(body) >= 4) return false;
-  return markLastCacheableBlock(last);
+  return markLastCacheableBlock(last, tailCacheControl(messages));
 }
 
 // Re-anchor cache breakpoints on a Claude passthrough body (same policy as
@@ -438,6 +451,7 @@ export function anchorClaudeCache(body) {
 
   if (Array.isArray(body.messages)) {
     let anchored = null;
+    const tail = tailCacheControl(body.messages);
     for (let i = body.messages.length - 1; i >= 0; i--) {
       const msg = body.messages[i];
       if (!Array.isArray(msg.content)) continue;
@@ -446,14 +460,14 @@ export function anchorClaudeCache(body) {
       // Prefer the last assistant turn: it ends a completed exchange, so the
       // prefix up to it stays byte-stable across the following requests.
       if (anchored || msg.role !== ROLE.ASSISTANT) continue;
-      anchored = markLastCacheableBlock(msg);
+      anchored = markLastCacheableBlock(msg, tail);
     }
 
     // First turn of a conversation has no assistant yet — anchor the final
     // message instead, so the opening prompt is cached rather than paid twice.
     if (!anchored) {
       for (let i = body.messages.length - 1; i >= 0 && !anchored; i--) {
-        anchored = markLastCacheableBlock(body.messages[i]);
+        anchored = markLastCacheableBlock(body.messages[i], tail);
       }
     }
 
@@ -617,7 +631,7 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
           for (let j = msg.content.length - 1; j >= 0; j--) {
             const block = msg.content[j];
             if (block.type !== CLAUDE_BLOCK.THINKING && block.type !== CLAUDE_BLOCK.REDACTED_THINKING) {
-              block.cache_control = { type: "ephemeral" };
+              block.cache_control = { ...tailCacheControl(filtered) };
               break;
             }
           }
